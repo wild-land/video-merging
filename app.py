@@ -526,6 +526,8 @@ class Handler(BaseHTTPRequestHandler):
             self.serve_file("app.css", "text/css; charset=utf-8")
         elif path == "/app.js":
             self.serve_file("app.js", "application/javascript; charset=utf-8")
+        elif path == "/icon.png":
+            self.serve_file("icon.png", "image/png")
         elif path == "/api/config":
             config = get_config()
             self.json({"config": config, "next_run": next_run(config),

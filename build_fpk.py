@@ -18,7 +18,7 @@ from zipfile import ZipFile
 ROOT = Path(__file__).resolve().parent
 TEMPLATE = ROOT / "fpk" / "easynvr-merger"
 DIST = ROOT / "dist"
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 WHEELS = {
     "x86": (
         "manylinux2014_x86_64",

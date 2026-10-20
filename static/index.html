@@ -4,13 +4,14 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#0c1424">
-  <title>EasyNVR 录像合并</title>
+  <title>录像合并</title>
+  <link rel="icon" type="image/png" href="./icon.png">
   <link rel="stylesheet" href="./app.css">
 </head>
 <body>
   <div class="shell">
     <aside class="sidebar">
-      <div class="brand"><div class="brand-icon">E<span>↗</span></div><div><strong>EasyNVR</strong><small>录像合并控制台</small></div></div>
+      <div class="brand"><img class="brand-icon" src="./icon.png" alt=""><div><strong>录像合并</strong><small>执行计划与日志</small></div></div>
       <nav aria-label="主导航">
         <a href="#overview" class="nav-link active"><span class="nav-glyph">▦</span> 概览</a>
         <a href="#schedule" class="nav-link"><span class="nav-glyph">◷</span> 执行计划</a>
@@ -41,7 +42,7 @@
         </section>
 
         <section id="history" class="section-block history"><div class="section-heading"><div><div class="section-kicker">02 / ACTIVITY</div><h2>任务与日志</h2><p>查看每次扫描、合并结果和错误详情。</p></div><div class="history-actions"><button class="refresh" id="refresh" type="button">↻ 刷新记录</button><button class="refresh clear-logs" id="clear-logs" type="button">清空日志</button></div></div><div class="tabs" role="tablist"><button role="tab" aria-selected="true" data-tab="runs">执行记录</button><button role="tab" aria-selected="false" data-tab="jobs">合并视频</button><button role="tab" aria-selected="false" data-tab="events">详细日志</button></div><div class="table-panel" id="history-content"><div class="empty">正在读取记录…</div></div></section>
-        <footer><span>EasyNVR 录像合并控制台</span><span>任务和日志保存在本地</span></footer>
+        <footer><span>录像合并</span><span>任务和日志保存在本地</span></footer>
       </div>
     </main>
   </div>

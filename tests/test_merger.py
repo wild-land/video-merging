@@ -200,6 +200,7 @@ class MergerTests(unittest.TestCase):
                 self.assertIn(b"308 Permanent Redirect", response("/app/easynvr-merger"))
                 self.assertIn(b"200 OK", response("/app/easynvr-merger/"))
                 self.assertIn(b"text/css", response("/app/easynvr-merger/app.css"))
+                self.assertIn(b"image/png", response("/app/easynvr-merger/icon.png"))
                 self.assertIn(b'"config"', response("/app/easynvr-merger/api/config"))
                 self.assertIn(b"403", response("/app/easynvr-merger/api/config", False))
                 self.assertIn(b"404", response("/api/config"))
