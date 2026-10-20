@@ -1,0 +1,22 @@
+Bundled FFmpeg executable
+==========================
+
+The Linux FFmpeg executable in this application is extracted without changes
+from the imageio-ffmpeg 0.6.0 platform wheel published on PyPI:
+https://pypi.org/project/imageio-ffmpeg/0.6.0/
+
+x86_64 wheel SHA-256:
+c7e46fcec401dd990405049d2e2f475e2b397779df2519b544b8aab515195282
+
+aarch64 wheel SHA-256:
+1d47bebd83d2c5fc770720d211855f208af8a596c82d17730aa51e815cdee6dc
+
+The bundled binaries report --enable-gpl and --enable-version3. FFmpeg is
+licensed under the GNU GPL for these builds. The GPLv3 text is included in
+GPL-3.0.txt. FFmpeg project source and licensing information:
+https://ffmpeg.org/download.html
+https://ffmpeg.org/legal.html
+
+The imageio-ffmpeg Python wrapper is not bundled. Its BSD-2-Clause license
+is included as imageio-ffmpeg-LICENSE because the executable is extracted
+from the wheel distribution.

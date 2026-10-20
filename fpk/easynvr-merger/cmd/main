@@ -1,0 +1,90 @@
+#!/bin/bash
+set -u
+
+APP_DEST="${TRIM_APPDEST:?}"
+VAR_DIR="${TRIM_PKGVAR:?}"
+PID_FILE="$VAR_DIR/service.pid"
+LOG_FILE="$VAR_DIR/service.log"
+PYTHON=/var/apps/python312/target/bin/python3
+FFMPEG="$APP_DEST/bin/ffmpeg"
+APP_SCRIPT="$APP_DEST/server/app.py"
+
+report_error() {
+    printf '%s\n' "$1" >&2
+    if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+        printf '%s\n' "$1" > "$TRIM_TEMP_LOGFILE"
+    fi
+}
+
+running() {
+    [ -s "$PID_FILE" ] || return 1
+    local pid
+    pid=$(cat "$PID_FILE")
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    [ -r "/proc/$pid/cmdline" ] || return 1
+    tr '\0' ' ' < "/proc/$pid/cmdline" | grep -Fq "$APP_SCRIPT"
+}
+
+start_app() {
+    mkdir -p "$VAR_DIR"
+    if running; then return 0; fi
+    if [ ! -x "$PYTHON" ]; then
+        report_error "缺少 Python 3.12 运行时，请确认应用依赖 python312 已安装。"
+        return 1
+    fi
+    if [ ! -x "$FFMPEG" ]; then
+        report_error "安装包中的 FFmpeg 不可执行，请安装与设备架构对应的 fpk。"
+        return 1
+    fi
+    local accessible="${TRIM_DATA_ACCESSIBLE_PATHS:-}"
+    local access_root="${accessible%%:*}"
+    if [ -z "$access_root" ]; then
+        access_root="$VAR_DIR/authorization-required"
+        mkdir -p "$access_root"
+        export AUTHORIZATION_REQUIRED=1
+    else
+        export AUTHORIZATION_REQUIRED=0
+    fi
+    export DATA_DIR="$VAR_DIR"
+    export SOURCE_ROOT="$access_root"
+    export OUTPUT_ROOT="$access_root"
+    export SOCKET_PATH="$APP_DEST/app.sock"
+    export BASE_PATH=/app/easynvr-merger
+    export GATEWAY_MODE=1
+    export PATH="$APP_DEST/bin:/var/apps/python312/target/bin:$PATH"
+    rm -f "$SOCKET_PATH"
+    nohup "$PYTHON" "$APP_SCRIPT" >> "$LOG_FILE" 2>&1 < /dev/null &
+    echo "$!" > "$PID_FILE"
+    local count=0
+    while [ "$count" -lt 10 ]; do
+        if [ -S "$SOCKET_PATH" ] && running; then return 0; fi
+        sleep 1
+        count=$((count + 1))
+    done
+    report_error "服务启动失败，请查看 $LOG_FILE。"
+    return 1
+}
+
+stop_app() {
+    if ! running; then
+        rm -f "$PID_FILE"
+        return 0
+    fi
+    local pid count=0
+    pid=$(cat "$PID_FILE")
+    kill -TERM "$pid" 2>/dev/null || true
+    while running && [ "$count" -lt 15 ]; do
+        sleep 1
+        count=$((count + 1))
+    done
+    if running; then kill -KILL "$pid" 2>/dev/null || true; fi
+    rm -f "$PID_FILE" "$APP_DEST/app.sock"
+}
+
+case "${1:-}" in
+    start) start_app ;;
+    stop) stop_app ;;
+    status) if running; then exit 0; else exit 3; fi ;;
+    *) exit 1 ;;
+esac

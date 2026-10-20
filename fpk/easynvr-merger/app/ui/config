@@ -1,0 +1,15 @@
+{
+  ".url": {
+    "easynvr-merger.Application": {
+      "title": "EasyNVR 录像合并",
+      "icon": "images/icon_{0}.png",
+      "type": "iframe",
+      "protocol": "",
+      "gatewayPrefix": "/app/easynvr-merger",
+      "gatewaySocket": "app.sock",
+      "url": "/app/easynvr-merger/",
+      "allUsers": false,
+      "control": { "accessPerm": "readonly" }
+    }
+  }
+}

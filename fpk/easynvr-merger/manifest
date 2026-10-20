@@ -1,0 +1,13 @@
+appname               = easynvr-merger
+version               = 1.0.4
+display_name          = EasyNVR 录像合并
+desc                  = 按日期和片段数量合并 EasyNVR 录像，提供定时计划与持久化日志。
+platform              = x86
+source                = thirdparty
+maintainer            = EasyNVR Merger
+desktop_uidir         = ui
+desktop_applaunchname = easynvr-merger.Application
+install_dep_apps      = python312
+ctl_stop              = true
+checkport             = false
+disable_authorization_path = false

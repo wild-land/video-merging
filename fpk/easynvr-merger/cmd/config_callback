@@ -1,0 +1,7 @@
+#!/bin/bash
+set -e
+MAIN="/var/apps/${TRIM_APPNAME:?}/cmd/main"
+if "$MAIN" status; then
+    "$MAIN" stop
+    "$MAIN" start
+fi

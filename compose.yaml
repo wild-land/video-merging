@@ -1,0 +1,15 @@
+services:
+  easynvr-merger:
+    build: .
+    container_name: easynvr-merger
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-8080}:8080"
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      APP_USERNAME: ${APP_USERNAME:-}
+      APP_PASSWORD: ${APP_PASSWORD:-}
+    volumes:
+      - ${EASYNVR_RECORDINGS:?Set EASYNVR_RECORDINGS in .env}:/recordings:ro
+      - ${MERGED_OUTPUT:?Set MERGED_OUTPUT in .env}:/merged
+      - ${APP_DATA_PATH:-./data}:/data
