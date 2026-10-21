@@ -10,7 +10,9 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
+import urllib.request
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -18,7 +20,7 @@ from zipfile import ZipFile
 ROOT = Path(__file__).resolve().parent
 TEMPLATE = ROOT / "fpk" / "easynvr-merger"
 DIST = ROOT / "dist"
-VERSION = "1.0.5"
+VERSION = "1.1.0"
 WHEELS = {
     "x86": (
         "manylinux2014_x86_64",
@@ -32,6 +34,12 @@ WHEELS = {
         "1d47bebd83d2c5fc770720d211855f208af8a596c82d17730aa51e815cdee6dc",
         "imageio_ffmpeg/binaries/ffmpeg-linux-aarch64-v7.0.2",
     ),
+}
+SEVEN_ZIP = {
+    "x86": ("7z2604-linux-x64.tar.xz",
+            "fc0327ba27e89bd086cf426dff17d77de582953cdbbc10a6576540a06853ffcd"),
+    "arm": ("7z2604-linux-arm64.tar.xz",
+            "5b0ac3aa91c1e3499f011d6af69d7f6b4de3ef2f011d9e2ff44c58ebd04aa388"),
 }
 
 
@@ -52,8 +60,23 @@ def wheel_for(arch: str, cache: Path) -> tuple[Path, str]:
     return wheel, binary
 
 
+def seven_zip_for(arch: str, cache: Path) -> Path:
+    filename, expected = SEVEN_ZIP[arch]
+    cache.mkdir(parents=True, exist_ok=True)
+    archive = cache / filename
+    if not archive.exists():
+        url = f"https://github.com/ip7z/7zip/releases/download/26.04/{filename}"
+        with urllib.request.urlopen(url, timeout=60) as response, archive.open("wb") as output:
+            shutil.copyfileobj(response, output)
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    if digest != expected:
+        raise RuntimeError(f"7-Zip 压缩包校验失败：{archive}（SHA-256 {digest}）")
+    return archive
+
+
 def build(arch: str, fnpack: str, cache: Path) -> Path:
     wheel, binary = wheel_for(arch, cache)
+    seven_zip_archive = seven_zip_for(arch, cache)
     with tempfile.TemporaryDirectory(prefix=f"easynvr-fpk-{arch}-") as temporary:
         stage = Path(temporary) / "easynvr-merger"
         shutil.copytree(TEMPLATE, stage)
@@ -78,6 +101,12 @@ def build(arch: str, fnpack: str, cache: Path) -> Path:
             licenses.mkdir(parents=True, exist_ok=True)
             (licenses / "imageio-ffmpeg-LICENSE").write_bytes(
                 package.read("imageio_ffmpeg-0.6.0.dist-info/LICENSE"))
+        with tarfile.open(seven_zip_archive, "r:xz") as package:
+            seven_zip = stage / "app" / "bin" / "7zz"
+            seven_zip.write_bytes(package.extractfile("7zz").read())
+            seven_zip.chmod(0o755)
+            (licenses / "7zip-LICENSE.txt").write_bytes(
+                package.extractfile("License.txt").read())
         subprocess.run([fnpack, "build", "--directory", str(stage)],
                        cwd=stage, check=True)
         candidates = list(stage.glob("*.fpk"))

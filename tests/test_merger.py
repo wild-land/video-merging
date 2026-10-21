@@ -27,6 +27,7 @@ class MergerTests(unittest.TestCase):
             patch.object(app, "DATA_DIR", self.data),
             patch.object(app, "DB_PATH", self.data / "test.sqlite3"),
             patch.object(app, "SERVICE_LOG_PATH", self.data / "service.log"),
+            patch.object(app, "ARCHIVE_PASSWORD_PATH", self.data / "archive-password"),
             patch.object(app, "SOURCE_ROOT", self.source),
             patch.object(app, "OUTPUT_ROOT", self.output),
         ]
@@ -34,15 +35,22 @@ class MergerTests(unittest.TestCase):
             item.start()
             self.addCleanup(item.stop)
         app.init_db()
+        app.save_archive_password("Abcdefg1!")
         config = {**app.DEFAULT_CONFIG, "source_dir": str(self.source),
                   "output_dir": str(self.output), "group_size": 60}
         with app.db() as connection:
             connection.execute("UPDATE config SET value=? WHERE id=1", (json.dumps(config),))
 
-    def run_merger(self, fake_merge):
+    def run_merger(self, fake_merge, fake_archive=None):
+        def archive_video(video, archive, password):
+            archive.write_bytes(b"encrypted archive")
+            return app.sha256_file(archive)
+
         merger = app.Merger()
         merger.lock.acquire()
-        with patch.object(app, "merge_clips", side_effect=fake_merge):
+        with patch.object(app, "merge_clips", side_effect=fake_merge), \
+                patch.object(app, "archive_video", side_effect=fake_archive or archive_video), \
+                patch.object(app, "verify_archive", side_effect=lambda path, password, name: app.sha256_file(path)):
             merger._run("manual")
 
     def test_prior_day_batches_deduplicate_and_late_arrival(self):
@@ -63,14 +71,16 @@ class MergerTests(unittest.TestCase):
         self.run_merger(fake_merge)
         self.assertEqual(sizes, [60, 60, 5])
         self.assertEqual(sorted(p.name for p in (self.output / day).iterdir()),
-                         ["Video1.mp4", "Video2.mp4", "Video3.mp4"])
+                         ["Video1.mp4.7z", "Video2.mp4.7z", "Video3.mp4.7z"])
+        self.assertFalse(any(prior.iterdir()))
+        self.assertTrue((today / "clip-000.mp4").exists())
         app.init_db()  # Reopen the persistent database as on service restart.
         self.run_merger(fake_merge)
         self.assertEqual(sizes, [60, 60, 5])
         (prior / "clip-125.mp4").write_bytes(b"late")
         self.run_merger(fake_merge)
         self.assertEqual(sizes, [60, 60, 5, 1])
-        self.assertTrue((self.output / day / "Video4.mp4").exists())
+        self.assertTrue((self.output / day / "Video4.mp4.7z").exists())
         with app.db() as connection:
             self.assertEqual(connection.execute(
                 "SELECT COUNT(*) FROM jobs WHERE status='success'").fetchone()[0], 4)
@@ -101,6 +111,188 @@ class MergerTests(unittest.TestCase):
             self.assertEqual(job["status"], "success")
             self.assertEqual(job["attempts"], 2)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 1)
+        self.assertFalse((folder / "a.mp4").exists())
+
+    def test_password_is_masked_in_api_and_rejected_when_weak(self):
+        for password in ("Abc123!", "abcdefgh1!", "ABCDEFGH1!", "Abcdefgh!", "Abcdefg12", "Abcdefg1 "):
+            with self.assertRaises(ValueError):
+                app.validate_archive_password(password)
+        self.assertEqual(app.read_archive_password(), "Abcdefg1!")
+        self.assertEqual(self.data.joinpath("archive-password").stat().st_mode & 0o777, 0o600)
+
+    def test_archive_failure_keeps_plain_video_and_source(self):
+        day = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+        folder = self.source / "camera" / "01" / day
+        folder.mkdir(parents=True)
+        clip = folder / "a.mp4"
+        clip.write_bytes(b"clip")
+
+        def failed_archive(video, archive, password):
+            raise RuntimeError("archive failed")
+
+        self.run_merger(lambda clips, output: output.write_bytes(b"merged"), failed_archive)
+        self.assertTrue(clip.exists())
+        self.assertTrue((self.output / day / "Video1.mp4").exists())
+        self.assertFalse((self.output / day / "Video1.mp4.7z").exists())
+        with patch.object(app, "validate_video"):
+            self.run_merger(lambda clips, output: output.write_bytes(b"merged"))
+        self.assertFalse(clip.exists())
+        self.assertFalse((self.output / day / "Video1.mp4").exists())
+        self.assertTrue((self.output / day / "Video1.mp4.7z").exists())
+
+    def test_only_verified_groups_are_deleted(self):
+        day = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+        folder = self.source / "camera" / "01" / day
+        folder.mkdir(parents=True)
+        good, bad = folder / "a.mp4", folder / "b.mp4"
+        good.write_bytes(b"good")
+        bad.write_bytes(b"bad")
+        config = {**app.get_config(), "group_size": 1}
+        with app.db() as connection:
+            connection.execute("UPDATE config SET value=? WHERE id=1", (json.dumps(config),))
+
+        def fake_merge(clips, output):
+            if clips[0] == bad:
+                raise RuntimeError("bad clip")
+            output.write_bytes(b"merged")
+
+        self.run_merger(fake_merge)
+        self.assertFalse(good.exists())
+        self.assertTrue(bad.exists())
+        with app.db() as connection:
+            self.assertEqual(connection.execute("SELECT status FROM runs ORDER BY id DESC LIMIT 1").fetchone()[0], "failed")
+
+    def test_replaced_plain_video_does_not_delete_source(self):
+        day = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+        folder = self.source / "camera" / "01" / day
+        folder.mkdir(parents=True)
+        clip = folder / "a.mp4"
+        clip.write_bytes(b"clip")
+
+        def failed_archive(video, archive, password):
+            raise RuntimeError("archive failed")
+
+        self.run_merger(lambda clips, output: output.write_bytes(b"correct merged"), failed_archive)
+        plain = self.output / day / "Video1.mp4"
+        plain.write_bytes(b"unrelated video")
+        with patch.object(app, "validate_video"):
+            self.run_merger(lambda clips, output: output.write_bytes(b"correct merged"))
+        self.assertTrue(clip.exists())
+        self.assertFalse((self.output / day / "Video1.mp4.7z").exists())
+
+    def test_changed_source_is_not_deleted(self):
+        day = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+        folder = self.source / "camera" / "01" / day
+        folder.mkdir(parents=True)
+        clip = folder / "a.mp4"
+        clip.write_bytes(b"original")
+
+        def replace_source(video, archive, password):
+            archive.write_bytes(b"encrypted archive")
+            clip.write_bytes(b"replacement")
+            return app.sha256_file(archive)
+
+        self.run_merger(lambda clips, output: output.write_bytes(b"merged"), replace_source)
+        self.assertEqual(clip.read_bytes(), b"replacement")
+        with app.db() as connection:
+            row = connection.execute("SELECT deleted_at,cleanup_error FROM job_files").fetchone()
+            self.assertIsNone(row["deleted_at"])
+            self.assertIn("原片已变更", row["cleanup_error"])
+
+    def test_published_archive_is_recovered_after_interruption(self):
+        day = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+        folder = self.source / "camera" / "01" / day
+        folder.mkdir(parents=True)
+        clip = folder / "a.mp4"
+        clip.write_bytes(b"clip")
+
+        def interrupted_archive(video, archive, password):
+            archive.write_bytes(b"encrypted archive")
+            raise RuntimeError("interrupted before database commit")
+
+        self.run_merger(lambda clips, output: output.write_bytes(b"merged"), interrupted_archive)
+        self.assertTrue(clip.exists())
+        with patch.object(app, "validate_video"):
+            self.run_merger(lambda clips, output: self.fail("must reuse archive"),
+                            lambda video, archive, password: self.fail("must reuse archive"))
+        self.assertFalse(clip.exists())
+        self.assertFalse((self.output / day / "Video1.mp4").exists())
+        self.assertTrue((self.output / day / "Video1.mp4.7z").exists())
+
+    def test_failed_cleanup_retries_without_remerging(self):
+        day = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+        folder = self.source / "camera" / "01" / day
+        folder.mkdir(parents=True)
+        clip = folder / "a.mp4"
+        clip.write_bytes(b"clip")
+        original_unlink = Path.unlink
+
+        def deny_once(path, *args, **kwargs):
+            if path == clip:
+                raise PermissionError("read-only source")
+            return original_unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", deny_once):
+            self.run_merger(lambda clips, output: output.write_bytes(b"merged"))
+        self.assertTrue(clip.exists())
+        self.run_merger(lambda clips, output: self.fail("completed group must not remerge"))
+        self.assertFalse(clip.exists())
+
+    def test_pre_upgrade_success_is_not_deleted_automatically(self):
+        day = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+        folder = self.source / "camera" / "01" / day
+        folder.mkdir(parents=True)
+        clip = folder / "a.mp4"
+        clip.write_bytes(b"old source")
+        stat = clip.stat()
+        output = self.output / day / "Video1.mp4"
+        output.parent.mkdir()
+        output.write_bytes(b"old merged")
+        with app.db() as connection:
+            job_id = connection.execute(
+                "INSERT INTO jobs(group_key,day,source_dir,output_path,status,created_at) "
+                "VALUES(?,?,?,?,?,?)",
+                ("old-job", day, str(folder), str(output), "success", app.now_text()),
+            ).lastrowid
+            connection.execute(
+                "INSERT INTO job_files(job_id,path,size,mtime_ns) VALUES(?,?,?,?)",
+                (job_id, str(clip), stat.st_size, stat.st_mtime_ns),
+            )
+        self.run_merger(lambda clips, output: self.fail("old success must be skipped"))
+        self.assertTrue(clip.exists())
+        self.assertTrue(output.exists())
+
+    @unittest.skipUnless(os.environ.get("SEVEN_ZIP_BIN"), "7zz integration binary not configured")
+    def test_real_archive_is_encrypted_but_names_are_visible(self):
+        video = self.output / "Video1.mp4"
+        archive = self.output / "Video1.mp4.7z"
+        video.write_bytes(b"test video bytes")
+        digest = app.archive_video(video, archive, "Abcdefg1!")
+        self.assertEqual(digest, app.verify_archive(archive, "Abcdefg1!", video.name))
+        listing = app.seven_zip(["l", "-slt", str(archive)])
+        self.assertIn("Path = Video1.mp4", listing)
+        self.assertIn("Encrypted = +", listing)
+        with self.assertRaises(RuntimeError):
+            app.verify_archive(archive, "Wrong999!", video.name)
+
+    @unittest.skipUnless(os.environ.get("SEVEN_ZIP_BIN"), "7zz integration binary not configured")
+    def test_real_archive_pipeline_deletes_only_after_success(self):
+        day = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+        folder = self.source / "camera" / "01" / day
+        folder.mkdir(parents=True)
+        clip = folder / "a.mp4"
+        clip.write_bytes(b"source clip")
+        merger = app.Merger()
+        merger.lock.acquire()
+        with patch.object(app, "merge_clips",
+                          side_effect=lambda clips, output: output.write_bytes(b"merged video")):
+            merger._run("manual")
+        archive = self.output / day / "Video1.mp4.7z"
+        self.assertTrue(archive.is_file())
+        self.assertFalse((self.output / day / "Video1.mp4").exists())
+        self.assertFalse(clip.exists())
+        self.assertEqual(app.verify_archive(archive, "Abcdefg1!", "Video1.mp4"),
+                         app.sha256_file(archive))
 
     def test_database_failure_does_not_leave_execution_locked(self):
         for fail_on_call in (1, 2):
@@ -178,8 +370,7 @@ class MergerTests(unittest.TestCase):
 
     def test_native_gateway_routes_assets_and_limits_access(self):
         socket_path = Path(self.temp.name) / "app.sock"
-        with patch.object(app, "BASE_PATH", "/app/easynvr-merger"), \
-                patch.dict(os.environ, {"GATEWAY_MODE": "1"}):
+        with patch.object(app, "BASE_PATH", "/app/easynvr-merger"):
             server = app.ThreadingUnixHTTPServer(str(socket_path), app.Handler)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -203,9 +394,12 @@ class MergerTests(unittest.TestCase):
                 self.assertIn(b"image/png", response("/app/easynvr-merger/icon.png"))
                 self.assertIn(b'"config"', response("/app/easynvr-merger/api/config"))
                 self.assertIn(b"403", response("/app/easynvr-merger/api/config", False))
+                self.assertIn(b"404", response("/app/easynvr-merger/health"))
                 self.assertIn(b"404", response("/api/config"))
 
                 config_response = response("/app/easynvr-merger/api/config")
+                self.assertNotIn(b"Abcdefg1!", config_response)
+                self.assertIn(b'"archive_password_set": true', config_response)
                 csrf_token = json.loads(config_response.split(b"\r\n\r\n", 1)[1])["csrf_token"]
                 payload = json.dumps({**app.get_config(), "group_size": 30,
                                       "enabled": True}).encode()
@@ -220,6 +414,25 @@ class MergerTests(unittest.TestCase):
                 self.assertEqual(app.get_config()["group_size"], 30)
                 self.assertTrue(app.get_config()["enabled"])
                 self.assertIsNotNone(app.next_run(app.get_config()))
+
+                changed = json.dumps({**app.get_config(),
+                                      "archive_password": "Another2!Strong"}).encode()
+                changed_response = response(
+                    "/app/easynvr-merger/api/config", method="POST", body=changed,
+                    extra_headers=gateway_headers + f"X-CSRF-Token: {csrf_token}\r\n")
+                self.assertIn(b"200 OK", changed_response)
+                self.assertNotIn(b"Another2!Strong", changed_response)
+                self.assertEqual(app.read_archive_password(), "Another2!Strong")
+                app.merger.lock.acquire()
+                try:
+                    blocked = json.dumps({**app.get_config(),
+                                          "archive_password": "Blocked3!Strong"}).encode()
+                    self.assertIn(b"409 Conflict", response(
+                        "/app/easynvr-merger/api/config", method="POST", body=blocked,
+                        extra_headers=gateway_headers + f"X-CSRF-Token: {csrf_token}\r\n"))
+                    self.assertEqual(app.read_archive_password(), "Another2!Strong")
+                finally:
+                    app.merger.lock.release()
 
                 manual_headers = gateway_headers + f"X-CSRF-Token: {csrf_token}\r\n"
                 with patch.object(app, "merger", app.Merger()):

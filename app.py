@@ -3,33 +3,34 @@
 
 from __future__ import annotations
 
-import base64
-import binascii
 import hashlib
 import hmac
 import json
 import os
 import re
 import secrets
+import shutil
 import socketserver
 import sqlite3
+import string
 import subprocess
 import tempfile
 import threading
 import time
 from datetime import datetime, timedelta
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 
-DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
-SOURCE_ROOT = Path(os.environ.get("SOURCE_ROOT", "/recordings")).resolve()
-OUTPUT_ROOT = Path(os.environ.get("OUTPUT_ROOT", "/merged")).resolve()
+DATA_DIR = Path(os.environ.get("DATA_DIR", Path(__file__).parent / ".local-data"))
+SOURCE_ROOT = Path(os.environ.get("SOURCE_ROOT", Path.home())).resolve()
+OUTPUT_ROOT = Path(os.environ.get("OUTPUT_ROOT", Path.home())).resolve()
 BASE_PATH = os.environ.get("BASE_PATH", "").rstrip("/")
 DB_PATH = DATA_DIR / "easynvr-merge.sqlite3"
 SERVICE_LOG_PATH = DATA_DIR / "service.log"
+ARCHIVE_PASSWORD_PATH = DATA_DIR / "archive-password"
 MAX_SERVICE_LOG_BYTES = 10 * 1024 * 1024
 STATIC_DIR = Path(__file__).parent / "static"
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -79,12 +80,16 @@ def init_db() -> None:
                 day TEXT NOT NULL, source_dir TEXT NOT NULL,
                 output_path TEXT NOT NULL UNIQUE, status TEXT NOT NULL,
                 attempts INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
-                finished_at TEXT, error TEXT
+                finished_at TEXT, error TEXT,
+                archive_verified_at TEXT, archive_sha256 TEXT,
+                plaintext_deleted_at TEXT
             );
             CREATE TABLE IF NOT EXISTS job_files (
                 job_id INTEGER NOT NULL REFERENCES jobs(id),
                 path TEXT NOT NULL, size INTEGER NOT NULL,
-                mtime_ns INTEGER NOT NULL, PRIMARY KEY (job_id, path)
+                mtime_ns INTEGER NOT NULL, device INTEGER, inode INTEGER,
+                deleted_at TEXT, cleanup_error TEXT,
+                PRIMARY KEY (job_id, path)
             );
             CREATE INDEX IF NOT EXISTS idx_jobs_day ON jobs(day);
             CREATE INDEX IF NOT EXISTS idx_job_files_path ON job_files(path);
@@ -96,6 +101,16 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, id);
         """)
+        for table, columns in {
+            "jobs": {"archive_verified_at": "TEXT", "archive_sha256": "TEXT",
+                     "plaintext_deleted_at": "TEXT"},
+            "job_files": {"device": "INTEGER", "inode": "INTEGER",
+                          "deleted_at": "TEXT", "cleanup_error": "TEXT"},
+        }.items():
+            existing = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+            for name, column_type in columns.items():
+                if name not in existing:
+                    connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {column_type}")
         connection.execute(
             "INSERT OR IGNORE INTO config(id, value) VALUES(1, ?)",
             (json.dumps(DEFAULT_CONFIG, ensure_ascii=False),),
@@ -124,9 +139,56 @@ def get_config() -> dict:
     return json.loads(row["value"])
 
 
+def archive_password_set() -> bool:
+    return ARCHIVE_PASSWORD_PATH.is_file() and ARCHIVE_PASSWORD_PATH.stat().st_size > 0
+
+
+def read_archive_password() -> str:
+    try:
+        return ARCHIVE_PASSWORD_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ValueError("请先在执行计划中设置压缩密码") from exc
+
+
+def validate_archive_password(password: str) -> str:
+    if not isinstance(password, str) or not 8 <= len(password) <= 128:
+        raise ValueError("压缩密码长度必须为 8–128 位")
+    if not all(32 <= ord(char) <= 126 for char in password):
+        raise ValueError("压缩密码只能使用可打印的英文字符")
+    if not (re.search(r"[a-z]", password) and re.search(r"[A-Z]", password)
+            and re.search(r"[0-9]", password)
+            and any(char in string.punctuation for char in password)):
+        raise ValueError("压缩密码必须包含大写字母、小写字母、数字和符号")
+    return password
+
+
+def save_archive_password(password: str) -> None:
+    password = validate_archive_password(password)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=".archive-password-", dir=DATA_DIR)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as secret_file:
+            secret_file.write(password)
+            secret_file.flush()
+            os.fsync(secret_file.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, ARCHIVE_PASSWORD_PATH)
+        fsync_directory(DATA_DIR)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def confined_path(value: str, root: Path) -> Path:
     if not isinstance(value, str) or not value.startswith("/"):
-        raise ValueError("目录必须是容器内的绝对路径")
+        raise ValueError("目录必须是飞牛设备上的绝对路径")
     path = Path(value).resolve()
     if path != root and root not in path.parents:
         raise ValueError(f"目录必须位于 {root} 内")
@@ -143,7 +205,7 @@ def validate_config(value: dict) -> dict:
     if source == output or source in output.parents or output in source.parents:
         raise ValueError("录像目录和输出目录不能互相包含")
     if not OUTPUT_ROOT.is_dir():
-        raise ValueError(f"输出挂载目录不存在：{OUTPUT_ROOT}")
+        raise ValueError(f"已授权的输出目录不存在：{OUTPUT_ROOT}")
     extension = value.get("extension")
     if extension not in (".mp4", ".ts"):
         raise ValueError("录像格式仅支持 .mp4 或 .ts")
@@ -263,9 +325,12 @@ def reserve_job(connection: sqlite3.Connection, day: str, folder: Path,
     used = {row[0] for row in connection.execute(
         "SELECT output_path FROM jobs WHERE day=?", (day,))}
     number = 1
-    while str(dest / f"Video{number}.mp4") in used or (dest / f"Video{number}.mp4").exists():
+    while (str(dest / f"Video{number}.mp4") in used
+           or str(dest / f"Video{number}.mp4.7z") in used
+           or (dest / f"Video{number}.mp4").exists()
+           or (dest / f"Video{number}.mp4.7z").exists()):
         number += 1
-    output = dest / f"Video{number}.mp4"
+    output = dest / f"Video{number}.mp4.7z"
     cursor = connection.execute(
         "INSERT INTO jobs(group_key,day,source_dir,output_path,status,created_at) "
         "VALUES(?,?,?,?,?,?)",
@@ -274,8 +339,9 @@ def reserve_job(connection: sqlite3.Connection, day: str, folder: Path,
     for clip in clips:
         stat = clip.stat()
         connection.execute(
-            "INSERT INTO job_files(job_id,path,size,mtime_ns) VALUES(?,?,?,?)",
-            (cursor.lastrowid, str(clip), stat.st_size, stat.st_mtime_ns),
+            "INSERT INTO job_files(job_id,path,size,mtime_ns,device,inode) VALUES(?,?,?,?,?,?)",
+            (cursor.lastrowid, str(clip), stat.st_size, stat.st_mtime_ns,
+             stat.st_dev, stat.st_ino),
         )
     return connection.execute("SELECT * FROM jobs WHERE id=?", (cursor.lastrowid,)).fetchone()
 
@@ -319,6 +385,80 @@ def validate_video(path: Path) -> None:
         raise RuntimeError(f"输出文件校验失败：{result.stderr[-2000:].strip()}")
 
 
+def archive_path_for(output: Path) -> Path:
+    return output if output.name.endswith(".mp4.7z") else Path(str(output) + ".7z")
+
+
+def plain_path_for(archive: Path) -> Path:
+    return Path(str(archive)[:-3])
+
+
+def seven_zip_binary() -> str:
+    binary = os.environ.get("SEVEN_ZIP_BIN") or shutil.which("7zz")
+    if not binary or not Path(binary).is_file():
+        raise RuntimeError("缺少 7-Zip 压缩程序（7zz）")
+    return binary
+
+
+def seven_zip(args: list[str], password: str | None = None,
+              cwd: Path | None = None) -> str:
+    # A bare -p asks 7-Zip to read from stdin; the password never enters argv.
+    result = subprocess.run(
+        [seven_zip_binary(), *args], input=(password + "\n") if password else "",
+        cwd=cwd, text=True, capture_output=True,
+    )
+    if result.returncode:
+        raise RuntimeError(f"7-Zip 退出码 {result.returncode}；归档或密码校验失败")
+    return result.stdout
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def verify_archive(archive: Path, password: str, expected_name: str) -> str:
+    listing = seven_zip(["l", "-slt", str(archive)])
+    if ("Type = 7z" not in listing or "Encrypted = +" not in listing
+            or f"Path = {expected_name}\n" not in listing):
+        raise RuntimeError("压缩包格式、加密状态或文件名校验失败")
+    seven_zip(["t", str(archive)], password=password)
+    return sha256_file(archive)
+
+
+def archive_video(video: Path, archive: Path, password: str) -> str:
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".archive-", dir=archive.parent) as temp_name:
+        temporary = Path(temp_name) / archive.name
+        seven_zip(["a", "-t7z", "-mx=1", "-mhe=off", "-p",
+                   str(temporary), video.name], password=password, cwd=video.parent)
+        digest = verify_archive(temporary, password, video.name)
+        with temporary.open("rb") as archive_file:
+            os.fsync(archive_file.fileno())
+        try:
+            os.link(temporary, archive)
+        except FileExistsError as exc:
+            raise RuntimeError(f"压缩包已存在，未覆盖：{archive}") from exc
+        fsync_directory(archive.parent)
+        return digest
+
+
+def verify_existing_video(clips: list[Path], output: Path) -> None:
+    # A previous run may have left this file after an archive failure. Rebuild it
+    # from the recorded clips before trusting it as the source for encryption.
+    if output.is_symlink():
+        raise RuntimeError(f"明文视频是符号链接，未使用：{output}")
+    validate_video(output)
+    with tempfile.TemporaryDirectory(prefix=".verify-merge-", dir=output.parent) as name:
+        comparison = Path(name) / output.name
+        merge_clips(clips, comparison)
+        if sha256_file(comparison) != sha256_file(output):
+            raise RuntimeError(f"现有合并视频与原片不一致，未继续：{output}")
+
+
 class Merger:
     def __init__(self):
         self.lock = threading.Lock()
@@ -347,6 +487,7 @@ class Merger:
         self.current_run_id = run_id
         try:
             config = get_config()
+            password = read_archive_password()
             source = confined_path(config["source_dir"], SOURCE_ROOT)
             output_root = confined_path(config["output_dir"], OUTPUT_ROOT)
             if not source.is_dir():
@@ -362,7 +503,7 @@ class Merger:
                     pending = [p for p in clips if str(p) not in completed]
                     for offset in range(0, len(pending), config["group_size"]):
                         group = pending[offset:offset + config["group_size"]]
-                        if self._process_group(run_id, folder, group, output_root):
+                        if self._process_group(run_id, folder, group, output_root, password):
                             ok += 1
                         else:
                             failed += 1
@@ -370,6 +511,7 @@ class Merger:
                     failed += 1
                     with db() as connection:
                         add_event(connection, run_id, None, "error", f"扫描 {folder} 失败：{exc}")
+            failed += self._cleanup_completed(run_id, source, output_root)
             status = "failed" if failed else "success"
             message = f"完成：成功 {ok} 组，失败 {failed} 组"
         except Exception as exc:
@@ -392,31 +534,47 @@ class Merger:
                 self.lock.release()
 
     def _process_group(self, run_id: int, folder: Path,
-                       clips: list[Path], output_root: Path) -> bool:
+                       clips: list[Path], output_root: Path, password: str) -> bool:
         day = folder.name
         with db() as connection:
             job = reserve_job(connection, day, folder, clips, output_root)
             job_id = job["id"]
-            output = Path(job["output_path"])
+            archive = archive_path_for(Path(job["output_path"]))
+            output = plain_path_for(archive)
+            for clip in clips:
+                stat = clip.stat()
+                connection.execute(
+                    "UPDATE job_files SET device=?,inode=? WHERE job_id=? AND path=? "
+                    "AND device IS NULL AND inode IS NULL AND size=? AND mtime_ns=?",
+                    (stat.st_dev, stat.st_ino, job_id, str(clip),
+                     stat.st_size, stat.st_mtime_ns),
+                )
             connection.execute(
                 "UPDATE jobs SET status='running', attempts=attempts+1, error=NULL "
                 "WHERE id=?", (job_id,))
             add_event(connection, run_id, job_id, "info",
-                      f"开始合并 {len(clips)} 段 → {output}")
+                      f"开始合并并加密 {len(clips)} 段 → {archive}")
         try:
-            if output.exists():
-                # A prior process may have finished the atomic rename before its DB commit.
+            if archive.exists():
                 if job["status"] not in ("interrupted", "running", "failed"):
-                    raise RuntimeError(f"输出文件已存在，未覆盖：{output}")
-                validate_video(output)
+                    raise RuntimeError(f"压缩包已存在，未覆盖：{archive}")
+                digest = verify_archive(archive, password, output.name)
             else:
-                merge_clips(clips, output)
+                if output.exists():
+                    if job["status"] not in ("interrupted", "running", "failed"):
+                        raise RuntimeError(f"输出文件已存在，未覆盖：{output}")
+                    verify_existing_video(clips, output)
+                else:
+                    merge_clips(clips, output)
+                digest = archive_video(output, archive, password)
             with db() as connection:
                 connection.execute(
-                    "UPDATE jobs SET status='success',finished_at=?,error=NULL WHERE id=?",
-                    (now_text(), job_id))
+                    "UPDATE jobs SET status='success',finished_at=?,error=NULL,"
+                    "output_path=?,archive_verified_at=?,archive_sha256=? WHERE id=?",
+                    (now_text(), str(archive), now_text(), digest, job_id))
                 add_event(connection, run_id, job_id, "success",
-                          f"合并成功：{output}（{len(clips)} 段）")
+                          f"合并及加密成功：{archive}（{len(clips)} 段）")
+            self._delete_plaintext(job_id, run_id, archive, digest)
             return True
         except Exception as exc:
             error = str(exc)[:4000]
@@ -426,6 +584,83 @@ class Merger:
                     (now_text(), error, job_id))
                 add_event(connection, run_id, job_id, "error", f"合并失败：{error}")
             return False
+
+    def _delete_plaintext(self, job_id: int, run_id: int, archive: Path,
+                          digest: str) -> None:
+        output = plain_path_for(archive)
+        if not archive.is_file() or archive.is_symlink() or sha256_file(archive) != digest:
+            raise RuntimeError(f"压缩包已变更，保留明文视频：{archive}")
+        if output.is_symlink():
+            raise RuntimeError(f"明文视频变成符号链接，未删除：{output}")
+        output.unlink(missing_ok=True)
+        fsync_directory(output.parent)
+        with db() as connection:
+            connection.execute("UPDATE jobs SET plaintext_deleted_at=? WHERE id=?",
+                               (now_text(), job_id))
+            add_event(connection, run_id, job_id, "info", f"已删除合并视频：{output}")
+
+    def _cleanup_completed(self, run_id: int, source: Path, output_root: Path) -> int:
+        failures = 0
+        with db() as connection:
+            jobs = connection.execute(
+                "SELECT * FROM jobs WHERE status='success' AND archive_verified_at IS NOT NULL "
+                "AND (plaintext_deleted_at IS NULL OR EXISTS ("
+                "SELECT 1 FROM job_files WHERE job_id=jobs.id AND deleted_at IS NULL))"
+            ).fetchall()
+        for job in jobs:
+            archive = Path(job["output_path"])
+            try:
+                if (not archive.name.endswith(".mp4.7z") or archive.is_symlink()
+                        or output_root not in archive.resolve().parents
+                        or not archive.is_file()
+                        or sha256_file(archive) != job["archive_sha256"]):
+                    raise RuntimeError(f"压缩包缺失或已变更，原片保留：{archive}")
+                if job["plaintext_deleted_at"] is None:
+                    self._delete_plaintext(job["id"], run_id, archive,
+                                           job["archive_sha256"])
+                with db() as connection:
+                    files = connection.execute(
+                        "SELECT * FROM job_files WHERE job_id=? AND deleted_at IS NULL",
+                        (job["id"],),
+                    ).fetchall()
+                for file in files:
+                    clip = Path(file["path"])
+                    try:
+                        if (clip.is_symlink() or clip.parent.resolve() != clip.parent
+                                or source not in clip.resolve().parents
+                                or str(clip.parent) != job["source_dir"]
+                                or clip.parent.name != job["day"]):
+                            raise RuntimeError(f"原片路径已变更，未删除：{clip}")
+                        try:
+                            stat = clip.stat()
+                        except FileNotFoundError:
+                            stat = None
+                        if stat is not None:
+                            if (file["device"] is None or file["inode"] is None
+                                    or (stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino)
+                                    != (file["size"], file["mtime_ns"],
+                                        file["device"], file["inode"])):
+                                raise RuntimeError(f"原片已变更，未删除：{clip}")
+                            clip.unlink()
+                            fsync_directory(clip.parent)
+                        with db() as connection:
+                            connection.execute(
+                                "UPDATE job_files SET deleted_at=?,cleanup_error=NULL "
+                                "WHERE job_id=? AND path=?", (now_text(), job["id"], str(clip)))
+                            add_event(connection, run_id, job["id"], "info",
+                                      f"原片已清理：{clip}" if stat else f"原片已不存在：{clip}")
+                    except (OSError, RuntimeError) as exc:
+                        failures += 1
+                        with db() as connection:
+                            connection.execute(
+                                "UPDATE job_files SET cleanup_error=? WHERE job_id=? AND path=?",
+                                (str(exc)[:4000], job["id"], str(clip)))
+                            add_event(connection, run_id, job["id"], "error", str(exc))
+            except (OSError, RuntimeError) as exc:
+                failures += 1
+                with db() as connection:
+                    add_event(connection, run_id, job["id"], "error", str(exc))
+        return failures
 
 
 def next_run(config: dict) -> str | None:
@@ -473,32 +708,12 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "EasyNVR-Merger/1.0"
 
     def log_message(self, format, *args):
-        peer = "gateway" if os.environ.get("GATEWAY_MODE") == "1" else self.address_string()
-        print("%s - %s" % (peer, format % args), flush=True)
+        print("gateway - %s" % (format % args), flush=True)
 
     def authorized(self) -> bool:
-        if os.environ.get("GATEWAY_MODE") == "1":
-            if self.headers.get("X-Trim-Isadmin", "").lower() == "true":
-                return True
-            self.json({"error": "仅管理员可访问"}, HTTPStatus.FORBIDDEN)
-            return False
-        username = os.environ.get("APP_USERNAME", "")
-        password = os.environ.get("APP_PASSWORD", "")
-        if not username or not password:
+        if self.headers.get("X-Trim-Isadmin", "").lower() == "true":
             return True
-        header = self.headers.get("Authorization", "")
-        try:
-            scheme, token = header.split(" ", 1)
-            pair = base64.b64decode(token, validate=True).decode("utf-8")
-            supplied_user, supplied_password = pair.split(":", 1)
-            if scheme.lower() == "basic" and hmac.compare_digest(supplied_user, username) and hmac.compare_digest(supplied_password, password):
-                return True
-        except (ValueError, UnicodeDecodeError, binascii.Error):
-            pass
-        self.send_response(HTTPStatus.UNAUTHORIZED)
-        self.send_header("WWW-Authenticate", 'Basic realm="EasyNVR Merge"')
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        self.json({"error": "仅管理员可访问"}, HTTPStatus.FORBIDDEN)
         return False
 
     def json(self, data, status=HTTPStatus.OK):
@@ -515,9 +730,6 @@ class Handler(BaseHTTPRequestHandler):
         path = self.route_path()
         if path is None:
             return
-        if path == "/health":
-            self.json({"ok": True})
-            return
         if not self.authorized():
             return
         if path == "/" or path == "/index.html":
@@ -531,8 +743,8 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/config":
             config = get_config()
             self.json({"config": config, "next_run": next_run(config),
+                       "archive_password_set": archive_password_set(),
                        "source_root": str(SOURCE_ROOT), "output_root": str(OUTPUT_ROOT),
-                       "deployment": "fpk" if os.environ.get("GATEWAY_MODE") == "1" else "docker",
                        "authorization_required": os.environ.get("AUTHORIZATION_REQUIRED") == "1",
                        "csrf_token": CSRF_TOKEN})
         elif path == "/api/status":
@@ -581,11 +793,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self.authorized():
             return
-        origin = self.headers.get("Origin")
-        gateway_mode = os.environ.get("GATEWAY_MODE") == "1"
-        if (not hmac.compare_digest(self.headers.get("X-CSRF-Token", ""), CSRF_TOKEN)
-                or (not gateway_mode and origin and
-                    urlparse(origin).netloc != self.headers.get("Host"))):
+        if not hmac.compare_digest(self.headers.get("X-CSRF-Token", ""), CSRF_TOKEN):
             self.json({"error": "跨站请求已拒绝"}, HTTPStatus.FORBIDDEN)
             return
         if self.headers.get("Content-Type", "").split(";", 1)[0] != "application/json":
@@ -598,13 +806,34 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(self.rfile.read(length))
             if path == "/api/config":
                 config = validate_config(data)
-                with db() as connection:
-                    connection.execute("UPDATE config SET value=? WHERE id=1",
-                                       (json.dumps(config, ensure_ascii=False),))
-                    add_event(connection, None, None, "info", "执行计划配置已更新")
-                self.json({"config": config, "next_run": next_run(config)})
+                new_password = data.get("archive_password", "")
+                if new_password:
+                    validate_archive_password(new_password)
+                elif not isinstance(new_password, str):
+                    raise ValueError("压缩密码格式无效")
+                if config["enabled"] and not (new_password or archive_password_set()):
+                    raise ValueError("启用计划前请设置压缩密码")
+                if new_password and not merger.lock.acquire(blocking=False):
+                    self.json({"error": "任务执行中，暂不能修改压缩密码"},
+                              HTTPStatus.CONFLICT)
+                    return
+                try:
+                    if new_password:
+                        save_archive_password(new_password)
+                    with db() as connection:
+                        connection.execute("UPDATE config SET value=? WHERE id=1",
+                                           (json.dumps(config, ensure_ascii=False),))
+                        add_event(connection, None, None, "info", "执行计划配置已更新")
+                finally:
+                    if new_password:
+                        merger.lock.release()
+                self.json({"config": config, "next_run": next_run(config),
+                           "archive_password_set": archive_password_set()})
             elif path == "/api/run":
-                if not merger.start("manual"):
+                if not archive_password_set():
+                    self.json({"error": "请先在执行计划中设置压缩密码"},
+                              HTTPStatus.BAD_REQUEST)
+                elif not merger.start("manual"):
                     self.json({"error": "已有任务正在执行"}, HTTPStatus.CONFLICT)
                 else:
                     self.json({"started": True}, HTTPStatus.ACCEPTED)
@@ -647,21 +876,17 @@ class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStre
 
 
 def main():
-    if bool(os.environ.get("APP_USERNAME")) != bool(os.environ.get("APP_PASSWORD")):
-        raise SystemExit("APP_USERNAME 和 APP_PASSWORD 必须同时设置，或同时留空")
+    required = ("DATA_DIR", "SOURCE_ROOT", "OUTPUT_ROOT", "BASE_PATH", "SOCKET_PATH")
+    missing = [name for name in required if not os.environ.get(name)]
+    if missing:
+        raise SystemExit(f"缺少飞牛应用启动环境变量：{', '.join(missing)}")
     init_db()
     threading.Thread(target=scheduler, args=(merger,), daemon=True).start()
-    socket_path = os.environ.get("SOCKET_PATH")
-    if socket_path:
-        socket_file = Path(socket_path)
-        socket_file.unlink(missing_ok=True)
-        server = ThreadingUnixHTTPServer(str(socket_file), Handler)
-        socket_file.chmod(0o660)
-        print(f"EasyNVR merger listening on {socket_file}", flush=True)
-    else:
-        port = int(os.environ.get("PORT", "8080"))
-        server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
-        print(f"EasyNVR merger listening on :{port}", flush=True)
+    socket_file = Path(os.environ["SOCKET_PATH"])
+    socket_file.unlink(missing_ok=True)
+    server = ThreadingUnixHTTPServer(str(socket_file), Handler)
+    socket_file.chmod(0o660)
+    print(f"EasyNVR merger listening on {socket_file}", flush=True)
     server.serve_forever()
 
 

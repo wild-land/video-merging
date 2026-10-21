@@ -1,7 +1,7 @@
 appname               = easynvr-merger
-version               = 1.0.5
+version               = 1.1.0
 display_name          = 录像合并
-desc                  = 按日期和片段数量合并 EasyNVR 录像，提供定时计划与持久化日志。
+desc                  = 按日期合并 EasyNVR 录像并加密归档，提供定时计划与持久化日志。
 platform              = x86
 source                = thirdparty
 maintainer            = EasyNVR Merger

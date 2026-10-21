@@ -27,19 +27,25 @@ async function api(url, options = {}) {
   return body;
 }
 async function loadConfig() {
-  const {config, next_run, source_root, output_root, deployment, authorization_required, csrf_token} = await api('/api/config');
+  const {config, next_run, source_root, output_root, authorization_required, archive_password_set, csrf_token} = await api('/api/config');
   csrfToken = csrf_token;
   for (const [key, value] of Object.entries(config)) {
     const input = form.elements.namedItem(key);
     if (input) input.type === 'checkbox' ? input.checked = value : input.value = value;
   }
   form.elements.namedItem('run_time').value = `${String(config.start_hour).padStart(2, '0')}:${String(config.minute).padStart(2, '0')}`;
-  $('#source-hint').textContent = deployment === 'fpk'
-    ? (authorization_required ? '请先在飞牛应用设置中授权包含录像和输出目录的父目录，然后重启应用' : `录像目录须位于已授权目录 ${source_root} 内`)
-    : `录像目录须位于 ${source_root} 内（Docker 只读挂载）`;
+  const passwordInput = form.elements.namedItem('archive_password');
+  passwordInput.value = '';
+  passwordInput.placeholder = archive_password_set ? '********' : '设置压缩密码';
+  $('#password-hint').textContent = archive_password_set
+    ? '密码已设置，留空保持原密码；修改密码不会改变已有压缩包的密码。建议使用 15 位以上的独立密码。'
+    : '至少 8 位，包含大小写字母、数字和符号。建议使用 15 位以上的独立密码。';
+  $('#source-hint').textContent = authorization_required
+    ? '请先在飞牛应用设置中授权包含录像和输出目录的父目录，然后重启应用'
+    : `录像目录须位于已授权目录 ${source_root} 内，并具有删除权限`;
   $('#output-hint').textContent = `输出目录须位于 ${output_root} 内；会自动创建 YYYYMMDD 子文件夹`;
   $('#metric-next').textContent = next_run ? formatTime(next_run) : '未启用';
-  $('#metric-next-foot').textContent = next_run ? (deployment === 'fpk' ? '按飞牛设备时间执行' : '按容器时区执行') : '启用计划后显示下次时间';
+  $('#metric-next-foot').textContent = next_run ? '按飞牛设备时间执行' : '启用计划后显示下次时间';
   const chip = $('#plan-chip'); chip.textContent = config.enabled ? '● 计划已启用' : '○ 计划未启用'; chip.classList.toggle('off', !config.enabled);
 }
 async function loadStatus() {
@@ -73,7 +79,8 @@ function readForm() {
   const [start_hour, minute] = form.elements.namedItem('run_time').value.split(':').map(Number);
   return {source_dir:form.source_dir.value.trim(), output_dir:form.output_dir.value.trim(),
     extension:form.extension.value, group_size:Number(form.group_size.value), sort_mode:form.sort_mode.value,
-    enabled:form.enabled.checked, start_hour, minute};
+    enabled:form.enabled.checked, start_hour, minute,
+    archive_password:form.elements.namedItem('archive_password').value};
 }
 form.addEventListener('submit', async event => {
   event.preventDefault();
@@ -112,7 +119,5 @@ document.querySelectorAll('[data-tab]').forEach(tab => tab.addEventListener('cli
 document.querySelectorAll('.nav-link').forEach(link => link.addEventListener('click', () => {
   document.querySelectorAll('.nav-link').forEach(item => item.classList.toggle('active', item === link));
 }));
-function updateClock() {$('#clock').textContent = new Date().toLocaleString('zh-CN', {year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false});}
-updateClock(); setInterval(updateClock, 30000);
 Promise.all([loadConfig(), loadStatus(), loadHistory()]).catch(error => showToast(error.message));
 setInterval(refresh, 15000);

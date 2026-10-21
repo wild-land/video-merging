@@ -7,6 +7,7 @@ PID_FILE="$VAR_DIR/service.pid"
 LOG_FILE="$VAR_DIR/service.log"
 PYTHON=/var/apps/python312/target/bin/python3
 FFMPEG="$APP_DEST/bin/ffmpeg"
+SEVEN_ZIP="$APP_DEST/bin/7zz"
 APP_SCRIPT="$APP_DEST/server/app.py"
 
 report_error() {
@@ -37,6 +38,10 @@ start_app() {
         report_error "安装包中的 FFmpeg 不可执行，请安装与设备架构对应的 fpk。"
         return 1
     fi
+    if [ ! -x "$SEVEN_ZIP" ]; then
+        report_error "安装包中的 7-Zip 不可执行，请重新安装对应架构的 fpk。"
+        return 1
+    fi
     local accessible="${TRIM_DATA_ACCESSIBLE_PATHS:-}"
     local access_root="${accessible%%:*}"
     if [ -z "$access_root" ]; then
@@ -51,7 +56,6 @@ start_app() {
     export OUTPUT_ROOT="$access_root"
     export SOCKET_PATH="$APP_DEST/app.sock"
     export BASE_PATH=/app/easynvr-merger
-    export GATEWAY_MODE=1
     export PATH="$APP_DEST/bin:/var/apps/python312/target/bin:$PATH"
     rm -f "$SOCKET_PATH"
     nohup "$PYTHON" "$APP_SCRIPT" >> "$LOG_FILE" 2>&1 < /dev/null &
